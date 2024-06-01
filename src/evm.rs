@@ -64,7 +64,7 @@ impl Display for Instruction {
         use DataInstruction::*;
         use StackInstruction::*;
         match self {
-            Instruction::Stack(Dup(i)) => write!(f, "dup{i}"),
+            Instruction::Stack(Dup(i)) => write!(f, "dup{}", i + 1),
             Instruction::Stack(Swap(i)) => write!(f, "swap{i}"),
             Instruction::Stack(Push(c)) if c.is_zero() => write!(f, "push0"),
             Instruction::Stack(Push(c)) => write!(f, "push{} {c}", c.byte_len()),
