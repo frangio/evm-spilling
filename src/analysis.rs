@@ -12,7 +12,7 @@ pub fn count_occurrences(rblock: &ResolvedBlock) -> Vec<usize> {
                 for &x in args {
                     counts[x.index()] += 1;
                 }
-            },
+            }
         }
     }
     counts

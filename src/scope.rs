@@ -47,12 +47,13 @@ pub fn resolve(Block(ss): Block<String>) -> Result<ResolvedBlock> {
     let ss = ss.into_iter().map(|Statement(vs, e)| {
         let e = match e {
             Expression::Const(c) => Expression::Const(c),
+
             Expression::Op(op, args) => {
                 Expression::Op(
                     op,
                     args.into_iter().map(|x| env.get(x)).collect::<Result<_>>()?,
                 )
-            },
+            }
         };
 
         let vs = vs.into_iter().map(|v| {
