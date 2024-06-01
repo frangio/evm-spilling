@@ -1,44 +1,25 @@
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::iter::repeat;
+use std::collections::HashMap;
 
 use alloy_primitives::U256;
-use eyre::{ensure, Ok, OptionExt, Result};
+use eyre::{ensure, Ok, Result};
 
-use crate::{analysis::count_occurrences, evm::{self, DataInstruction, StackInstruction}, program::{Expression, Statement}, scope::{ResolvedBlock, Var}};
+use crate::scope::{ResolvedBlock, Var};
+use crate::program::{Expression, Statement};
+use crate::evm::{Instruction, DataInstruction, StackInstruction};
+use crate::analysis::count_occurrences;
 
-#[derive(PartialEq, Eq, Hash)]
-pub struct Label {
-    pub index: usize,
-}
-
-enum LabeledControlInstruction {
-    Jump(Label),
-    Jumpi(Label),
-    Jumpdest,
-}
-
-enum RegisterInstruction {
+#[derive(Clone)]
+enum PreStackInstruction {
+    Rotate { from_depth: usize, to_depth: usize },
     Dup(usize),
-    Swap(usize),
+    Push(Box<U256>),
 }
 
-enum Instruction {
-    Stack(StackInstruction),
-    Control(LabeledControlInstruction),
+#[derive(Clone)]
+enum PreInstruction {
+    Stack(PreStackInstruction),
     Data(DataInstruction),
-    Register(RegisterInstruction),
-    Spill(Box<(Instruction, RegisterInstruction)>),
-}
-
-impl Into<evm::Instruction> for Instruction {
-    fn into(self) -> evm::Instruction {
-        match self {
-            Instruction::Stack(i) => evm::Instruction::Stack(i),
-            Instruction::Control(_) => todo!(),
-            Instruction::Data(i) => evm::Instruction::Data(i),
-            Instruction::Register(_) => todo!(),
-            Instruction::Spill(_) => todo!(),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -47,49 +28,15 @@ enum VarInstance {
     Copy(Var),
 }
 
-impl VarInstance {
-    fn name(&self) -> Var {
-        use VarInstance::*;
-        match self {
-            Main(name) | Copy(name) => *name
-        }
-    }
-}
-
-#[derive(PartialEq, Eq)]
-enum SpillStatus {
-    Unopened,
-    Opened,
-    Closed,
-}
-
-#[derive(Clone, Copy)]
-struct Spill {
-    code_index: usize,
-    stack_depth: usize,
-}
-
-impl Spill {
-    fn new(code: &Vec<Instruction>, stack_depth: usize) -> Spill {
-        Spill {
-            code_index: code.len() - 1,
-            stack_depth,
-        }
-    }
-}
-
 struct VarMeta {
     main_index: usize,
     copy_index: Option<usize>,
-    spill_status: SpillStatus,
-    spill: Spill,
 }
 
 struct Machine {
-    code: Vec<Instruction>,
+    code: Vec<PreInstruction>,
     stack: Vec<VarInstance>,
     meta: HashMap<Var, VarMeta>,
-    spills: Vec<(Spill, bool)>,
 }
 
 impl Machine {
@@ -98,107 +45,84 @@ impl Machine {
             code: Vec::new(),
             stack: Vec::new(),
             meta: HashMap::new(),
-            spills: Vec::new(),
         }
+    }
+
+    fn get_meta(&mut self, name: Var) -> &mut VarMeta {
+        self.meta.get_mut(&name).unwrap()
     }
 
     fn set_location(&mut self, instance: VarInstance, index: Option<usize>) {
         match instance {
             VarInstance::Main(name) => {
                 if let Some(index) = index {
-                    self.meta.get_mut(&name).unwrap().main_index = index;
+                    self.get_meta(name).main_index = index;
                 } else {
                     let meta = self.meta.remove(&name).unwrap();
-                    if meta.spill_status != SpillStatus::Unopened {
-                        self.spills.push((meta.spill, false));
-                    }
+                    assert!(meta.copy_index.is_none());
                 }
-            },
-            VarInstance::Copy(name) => {
-                self.meta.get_mut(&name).unwrap().copy_index = index;
-            },
-        }
-    }
-
-    fn set_spill(&mut self, from_depth: usize, name: Var, spill: Spill) {
-        let meta = self.meta.get_mut(&name).unwrap();
-        if from_depth > 16 {
-            if meta.spill_status == SpillStatus::Unopened {
-                self.spills.push((meta.spill, true));
             }
-            meta.spill_status = SpillStatus::Opened;
-            meta.spill = spill;
-        } else if meta.spill_status != SpillStatus::Closed {
-            meta.spill_status = SpillStatus::Closed;
-            meta.spill = spill;
+
+            VarInstance::Copy(name) => {
+                self.get_meta(name).copy_index = index;
+            }
         }
     }
 
-    fn find_depth(&self, name: Var) -> usize {
+    fn find(&self, name: Var) -> usize {
         let meta = self.meta.get(&name).unwrap();
         let index = meta.copy_index.unwrap_or(meta.main_index);
-        self.stack.len() - 1 - index
+        let depth = self.stack.len() - 1 - index;
+        depth
     }
 
     fn pop(&mut self) {
         let instance = self.stack.pop().unwrap();
-        self.code.push(Instruction::Data(DataInstruction::Pop));
         self.set_location(instance, None);
+        self.code.push(PreInstruction::Stack(PreStackInstruction::Rotate { from_depth: 0, to_depth: 0 }));
+        self.code.push(PreInstruction::Data(DataInstruction::Pop));
     }
 
     fn push(&mut self, name: Var, value: U256) {
         self.stack.push(VarInstance::Main(name));
-        self.code.push(Instruction::Stack(StackInstruction::Push(value.into())));
         self.meta.insert(name, VarMeta {
             main_index: self.stack.len() - 1,
             copy_index: None,
-            spill_status: SpillStatus::Unopened,
-            spill: Spill::new(&self.code, 0),
         });
+        self.code.push(PreInstruction::Stack(PreStackInstruction::Push(value.into())));
     }
 
-    fn stack_swap(&mut self, from_depth: usize, to_depth: usize) -> VarInstance {
-        let stack_top = self.stack.len() - 1;
-        let from_index = stack_top - from_depth;
-        let to_index = stack_top - to_depth;
+    fn stack_swap(&mut self, from_depth: usize, to_depth: usize) {
+        let top_index = self.stack.len() - 1;
+        let from_index = top_index - from_depth;
+        let to_index = top_index - to_depth;
         let from_instance = self.stack[from_index];
         let to_instance = self.stack[to_index];
         self.stack.swap(from_index, to_index);
         self.set_location(from_instance, Some(to_index));
         self.set_location(to_instance, Some(from_index));
-        to_instance
     }
 
-    fn swap_to(&mut self, from_name: Var, to_depth: usize) {
+    fn rotate_to(&mut self, from_name: Var, to_depth: usize) {
         assert!(to_depth <= 16, "Swap too deep");
-        let from_depth = self.find_depth(from_name);
-        if from_depth != to_depth {
-            self.stack_swap(from_depth, 0);
-            self.code.push(Instruction::Stack(StackInstruction::Swap(from_depth)));
-            self.set_spill(from_depth, from_name, Spill::new(&self.code, 0));
-
-            let to_instance = self.stack_swap(0, to_depth);
-            self.code.push(Instruction::Stack(StackInstruction::Swap(to_depth)));
-            self.set_spill(to_depth, to_instance.name(), Spill::new(&self.code, 0))
-        }
+        let from_depth = self.find(from_name);
+        self.stack_swap(from_depth, 0);
+        self.stack_swap(0, to_depth);
+        self.code.push(PreInstruction::Stack(PreStackInstruction::Rotate { from_depth, to_depth }));
     }
 
     fn copy_to(&mut self, from_name: Var, to_depth: usize) {
         assert!(to_depth <= 16, "Copy too deep");
-        let from_depth = self.find_depth(from_name);
 
-        let instance = VarInstance::Copy(from_name);
-        self.stack.push(instance);
-        let index = self.stack.len() - 1;
-        self.code.push(Instruction::Stack(StackInstruction::Dup(from_depth)));
-        self.set_location(instance, Some(index));
-        self.set_spill(from_depth, from_name, Spill::new(&self.code, 0));
+        let from_depth = self.find(from_name);
+        let copy_instance = VarInstance::Copy(from_name);
+        self.stack.push(copy_instance);
+        self.set_location(copy_instance, Some(self.stack.len() - 1));
+        self.code.push(PreInstruction::Stack(PreStackInstruction::Dup(from_depth)));
 
         if to_depth != 0 {
-            let to_instance = self.stack_swap(0, to_depth);
-
-            self.code.push(Instruction::Stack(StackInstruction::Swap(to_depth)));
-            self.set_spill(to_depth, to_instance.name(), Spill::new(&self.code, 0));
+            self.stack_swap(0, to_depth);
+            self.code.push(PreInstruction::Stack(PreStackInstruction::Rotate { from_depth: 0, to_depth }));
         }
     }
 
@@ -212,21 +136,164 @@ impl Machine {
         }
         self.stack.extend(ress.iter().map(|&name| VarInstance::Main(name)));
 
-        self.code.push(Instruction::Data(op));
+        self.code.push(PreInstruction::Data(op));
 
         for (i, &name) in ress.iter().enumerate() {
-            let depth = nress - 1 - i;
             self.meta.insert(name, VarMeta {
                 main_index: stack_base + i,
                 copy_index: None,
-                spill_status: SpillStatus::Unopened,
-                spill: Spill::new(&self.code, depth),
             });
         }
     }
 }
 
-pub fn generate(rblock: &ResolvedBlock) -> Result<impl Iterator<Item=impl Into<evm::Instruction>>> {
+#[derive(Clone, Copy)]
+struct SpillLocation {
+    code_index: usize,
+    depth: usize,
+}
+
+struct Spill {
+    location: SpillLocation,
+    outward: bool,
+}
+
+fn make_spills(machine: &Machine) -> Vec<Spill> {
+    enum SpillStatus {
+        Unspillable,
+        MaybeSpilled(SpillLocation),
+        Spilled,
+        MaybeRestored(SpillLocation),
+        Restored,
+    }
+
+    use SpillStatus::*;
+
+    impl SpillStatus {
+        fn set_reachable_at(&mut self, location: SpillLocation) {
+            assert!(location.depth < 16);
+            match *self {
+                Unspillable => (),
+                MaybeSpilled(_) => *self = MaybeSpilled(location),
+                Spilled => *self = MaybeRestored(location),
+                MaybeRestored(_) => (),
+                Restored => panic!("already restored?"),
+            }
+        }
+    }
+
+    struct State {
+        stack: Vec<SpillStatus>,
+        spills: Vec<Spill>,
+    }
+
+    impl State {
+        fn ensure_reachable(&mut self, depth: usize) {
+            if depth >= 16 {
+                let index = self.stack.len() - 1 - depth;
+                let ref mut status = self.stack[index];
+                match *status {
+                    Unspillable => panic!("unspillable accessed too deep"),
+                    MaybeSpilled(l) => {
+                        *status = Spilled;
+                        self.spills.push(Spill { location: l, outward: true });
+                    }
+                    Spilled => (),
+                    MaybeRestored(_) => *status = Spilled,
+                    Restored => panic!("restored back too deep"),
+                }
+            }
+        }
+    }
+
+    let mut state = State {
+        stack: Vec::with_capacity(machine.stack.capacity()),
+        spills: Vec::new(),
+    };
+
+    for (code_index, instr) in machine.code.iter().enumerate() {
+        match *instr {
+            PreInstruction::Stack(PreStackInstruction::Rotate { from_depth, to_depth }) => {
+                assert!(to_depth < 16);
+
+                let top_index = state.stack.len() - 1;
+                let from_index = top_index - from_depth;
+                let to_index = top_index - to_depth;
+
+                state.ensure_reachable(from_depth);
+
+                if from_depth < 16 {
+                    state.stack[from_index].set_reachable_at(SpillLocation { code_index, depth: to_depth });
+                } else {
+                    assert!(!matches!(state.stack[top_index], Unspillable));
+                    state.stack[top_index] = Spilled;
+
+                    assert!(matches!(state.stack[from_index], Spilled));
+                    state.stack[from_index] = Restored;
+                }
+
+                state.stack.swap(from_index, top_index);
+                state.stack.swap(top_index, to_index);
+            }
+
+            PreInstruction::Stack(PreStackInstruction::Dup(depth)) => {
+                state.ensure_reachable(depth);
+                if depth + 1 < 16 {
+                    let index = state.stack.len() - 1 - depth;
+                    state.stack[index].set_reachable_at(SpillLocation { code_index, depth: depth + 1 });
+                }
+                state.stack.push(Unspillable);
+            }
+
+            PreInstruction::Stack(PreStackInstruction::Push(_)) => {
+                state.stack.push(MaybeSpilled(SpillLocation { code_index, depth: 0 }));
+            }
+
+            PreInstruction::Data(op) => {
+                let (nargs, nress) = op.arity();
+                for status in state.stack.drain(state.stack.len() - nargs..) {
+                    if let MaybeRestored(l) = status {
+                        state.spills.push(Spill { location: l, outward: false });
+                    } else if let Spilled = status {
+                        panic!("spilled value not restored");
+                    }
+                }
+                state.stack.extend((0..nress).rev().map(|depth|
+                    MaybeSpilled(SpillLocation { code_index, depth })
+                ));
+            }
+        }
+    }
+
+    state.spills.sort_unstable_by_key(|s| s.location.code_index);
+    state.spills
+}
+
+fn register_store(register: usize) -> impl Iterator<Item=Instruction> {
+    use Instruction::*;
+    use StackInstruction::*;
+    use DataInstruction::*;
+
+    let ptr = (register * 32).try_into().unwrap();
+    [
+        Stack(Push(Box::new(ptr))),
+        Data(Mstore),
+    ].into_iter()
+}
+
+fn register_load(register: usize) -> impl Iterator<Item=Instruction> {
+    use Instruction::*;
+    use StackInstruction::*;
+    use DataInstruction::*;
+
+    let ptr = (register * 32).try_into().unwrap();
+    [
+        Stack(Push(Box::new(ptr))), // todo: fix register location
+        Data(Mload),
+    ].into_iter()
+}
+
+pub fn generate(rblock: &ResolvedBlock) -> Result<impl Iterator<Item=Instruction>> {
     let mut occurs = count_occurrences(&rblock);
     let mut machine = Machine::new();
 
@@ -236,7 +303,7 @@ pub fn generate(rblock: &ResolvedBlock) -> Result<impl Iterator<Item=impl Into<e
                 ensure!(ress.len() == 1, "Wrong number of results");
                 let name = ress[0];
                 machine.push(name, c);
-            },
+            }
 
             Expression::Op(ref op, ref args) => {
                 let op: DataInstruction = op.parse()?;
@@ -261,22 +328,135 @@ pub fn generate(rblock: &ResolvedBlock) -> Result<impl Iterator<Item=impl Into<e
                     if dup {
                         machine.copy_to(arg, to_depth);
                     } else {
-                        machine.swap_to(arg, to_depth);
+                        machine.rotate_to(arg, to_depth);
                     }
                 }
 
                 machine.apply(op, ress);
-            },
+            }
         }
 
         for &r in ress.iter().rev() {
             if occurs[r.index()] == 0 {
-                machine.swap_to(r, 0);
+                machine.rotate_to(r, 0);
                 machine.pop();
             }
         }
     }
 
+    let spills = make_spills(&machine);
 
-    Ok(machine.code.into_iter())
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StackItem {
+        Stack { value: usize },
+        Register { register: usize }
+    }
+
+    let mut code = Vec::with_capacity(machine.code.capacity());
+    let mut stack: Vec<Option<usize>> = Vec::with_capacity(machine.stack.capacity());
+    let mut register_count = 0;
+    let mut free_registers = Vec::new();
+
+    let mut spills_end = 0;
+
+    for (code_index, instr) in machine.code.into_iter().enumerate() {
+        let spills_start = spills[spills_end..].iter()
+            .position(|s| s.location.code_index >= code_index)
+            .map_or(spills.len(), |i| i + spills_end);
+
+        spills_end = spills[spills_start..].iter()
+            .position(|s| s.location.code_index > code_index)
+            .map_or(spills.len(), |i| i + spills_start);
+
+        let instr_spills = &spills[spills_start..spills_end];
+
+        match instr {
+            PreInstruction::Stack(PreStackInstruction::Rotate { from_depth, to_depth }) if from_depth != to_depth => {
+                let top_index = stack.len() - 1;
+                let from_index = top_index - from_depth;
+                let to_index = top_index - to_depth;
+
+                if from_depth < 16 {
+                    if from_depth > 0 {
+                        code.push(Instruction::Stack(StackInstruction::Swap(from_depth)));
+                        stack.swap(from_index, top_index);
+                    }
+                } else {
+                    let from_register = stack[from_index].unwrap();
+                    code.extend(register_load(from_register));
+                    code.push(Instruction::Stack(StackInstruction::Swap(1)));
+                    if from_depth != 0 {
+                        if let Some(top_register) = stack[top_index].take() {
+                            free_registers.push(top_register);
+                            code.extend(register_load(top_register));
+                            code.push(Instruction::Stack(StackInstruction::Swap(1)));
+                            code.extend(register_store(top_register));
+                        }
+                    }
+                    code.extend(register_store(from_register));
+                }
+
+                if to_depth > 0 {
+                    code.push(Instruction::Stack(StackInstruction::Swap(to_depth)));
+                    stack.swap(top_index, to_index);
+                }
+                // todo: more efficient spilling
+            }
+
+            PreInstruction::Stack(PreStackInstruction::Rotate { from_depth, to_depth }) => {
+                assert_eq!(from_depth, to_depth);
+            }
+
+            PreInstruction::Stack(PreStackInstruction::Dup(depth)) => {
+                let index = stack.len() - 1 - depth;
+                if let Some(register) = stack[index] {
+                    code.extend(register_load(register));
+                } else {
+                    assert!(depth < 16);
+                    code.push(Instruction::Stack(StackInstruction::Dup(depth)));
+                }
+                stack.push(None);
+            }
+
+            PreInstruction::Stack(PreStackInstruction::Push(c)) => {
+                code.push(Instruction::Stack(StackInstruction::Push(c)));
+                stack.push(None);
+            }
+
+            PreInstruction::Data(op) => {
+                code.push(Instruction::Data(op));
+                let (nargs, nress) = op.arity();
+                for item in stack.drain(stack.len() - nargs..) {
+                    assert!(item.is_none());
+                }
+                stack.extend(repeat(None).take(nress));
+            }
+        }
+
+        for &Spill { location, outward } in instr_spills {
+            let index = stack.len() - 1 - location.depth;
+
+            let register =
+                if outward {
+                    assert!(stack[index].is_none());
+                    let register = free_registers.pop().unwrap_or_else(|| {
+                        let register = register_count;
+                        register_count += 1;
+                        register
+                    });
+                    stack[index] = Some(register);
+                    register
+                } else {
+                    let register = stack[index].take().unwrap();
+                    free_registers.push(register);
+                    register
+                };
+
+            code.extend(register_load(register));
+            code.push(Instruction::Stack(StackInstruction::Swap(location.depth + 1)));
+            code.extend(register_store(register));
+        }
+    }
+
+    Ok(code.into_iter())
 }
